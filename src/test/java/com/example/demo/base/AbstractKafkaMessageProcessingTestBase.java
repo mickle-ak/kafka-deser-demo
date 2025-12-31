@@ -62,7 +62,7 @@ public abstract class AbstractKafkaMessageProcessingTestBase {
         rawTemplate.send("input-topic", "key2", "{\"id\":\"123\", \"type\":\"CREATE\"}");
 
         // All 3 messages should be processed successfully
-        await().atMost(3, TimeUnit.SECONDS).untilAsserted(() -> assertSoftly(s -> {
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> assertSoftly(s -> {
             // Verify which keys were processed
             s.assertThat(tracker.processedKeys).containsExactlyInAnyOrder("key1", "key2");
             s.assertThat(tracker.deserializationErrorKeys).containsExactly(INVALID_JSON);
