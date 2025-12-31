@@ -1,40 +1,53 @@
-package com.example.demo;
+package com.example.demo.batchListenerManuelRetry;
 
+import com.example.demo.base.*;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.springframework.core.log.LogAccessor;
+import org.springframework.context.annotation.Profile;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.listener.BatchAcknowledgingMessageListener;
 import org.springframework.kafka.listener.CommonErrorHandler;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.support.Acknowledgment;
-import org.springframework.kafka.support.serializer.SerializationUtils;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
+
+/**
+ * Batch listener implementation with manual retry logic.
+ *
+ * <p>Key characteristics:
+ * <ul>
+ *   <li>Processes messages in batches using {@link BatchAcknowledgingMessageListener}</li>
+ *   <li>Manual acknowledgment mode for at-least-once semantics</li>
+ *   <li>Manual retry logic within batch - retries individual records, not entire batch</li>
+ *   <li>Handles deserialization errors gracefully (null values)</li>
+ *   <li>Retryable exceptions: retry up to 3 times with 500ms backoff</li>
+ *   <li>Non-retryable exceptions: skip immediately and continue</li>
+ * </ul>
+ */
 @Slf4j
 @Component
-public class KafkaInputChannel {
+@Profile("batchListenerManuelRetry")
+public class BatchListenerManualRetry extends AbstractMessageListener {
 
     private final ConsumerFactory<String, DocumentOperation> consumerFactory;
     private final CommonErrorHandler errorHandler;
-    private final MessageProcessor messageProcessor;
-    public final AtomicInteger processedCount = new AtomicInteger(0);
-    public final AtomicInteger errorCount = new AtomicInteger(0);
 
-    public KafkaInputChannel(ConsumerFactory<String, DocumentOperation> consumerFactory,
-                             CommonErrorHandler errorHandler,
-                             MessageProcessor messageProcessor) {
+    public BatchListenerManualRetry(ConsumerFactory<String, DocumentOperation> consumerFactory,
+                                    CommonErrorHandler errorHandler,
+                                    MessageProcessor messageProcessor) {
+        super(messageProcessor);
         this.consumerFactory = consumerFactory;
         this.errorHandler = errorHandler;
-        this.messageProcessor = messageProcessor;
-        createListenerContainer();
+        start();
     }
 
-    private void createListenerContainer() {
+
+    @Override
+    protected ConcurrentMessageListenerContainer<String, DocumentOperation> createListenerContainer() {
         ContainerProperties containerProperties = new ContainerProperties("input-topic");
         containerProperties.setGroupId("test-group");
 
@@ -47,13 +60,11 @@ public class KafkaInputChannel {
         containerProperties.setMessageListener(
             (BatchAcknowledgingMessageListener<String, DocumentOperation>) this::handleBatch);
 
-        ConcurrentMessageListenerContainer<String, DocumentOperation> container =
-            new ConcurrentMessageListenerContainer<>(consumerFactory, containerProperties);
-
-        container.setCommonErrorHandler(errorHandler);
-
-        container.start();
+        var newContainer = new ConcurrentMessageListenerContainer<>(consumerFactory, containerProperties);
+        newContainer.setCommonErrorHandler(errorHandler);
+        return newContainer;
     }
+
 
     private void handleBatch(List<ConsumerRecord<String, DocumentOperation>> records,
                              Acknowledgment acknowledgment) {
@@ -89,12 +100,12 @@ public class KafkaInputChannel {
             try {
                 processRecord(data);
                 return; // Success - exit retry loop
-            } catch (ErrorHandlerConfig.NotRetryableException e) {
+            } catch (NotRetryableException e) {
                 // Not retryable - log and stop trying this record
                 log.error(">>> Non-retryable error processing record [{}], skipping: {}",
                           data.key(), ErrorHandlerConfig.exceptionAsString(e));
                 return; // Exit without incrementing processedCount
-            } catch (ErrorHandlerConfig.RetryableException e) {
+            } catch (RetryableException e) {
                 // Retryable exception - log and retry if attempts remain
                 if (attempt < maxAttempts) {
                     log.warn("Retrying ({} attempt) for key '{}': \n\t{}",
@@ -144,25 +155,4 @@ public class KafkaInputChannel {
         }
     }
 
-
-    private void processRecord(ConsumerRecord<String, DocumentOperation> data) {
-        messageProcessor.process(data);
-        processedCount.incrementAndGet();
-    }
-
-    private void processDeserializationError(ConsumerRecord<String, DocumentOperation> data) {
-        Exception ex = SerializationUtils.getExceptionFromHeader(
-                data,
-                SerializationUtils.VALUE_DESERIALIZER_EXCEPTION_HEADER,
-                new LogAccessor(KafkaInputChannel.class));
-
-        if (ex != null) {
-            log.error(">>> Deserialization error (NOT retryable) - topic: {}, partition: {}, offset: {}, error: {}",
-                      data.topic(), data.partition(), data.offset(), ex.getMessage());
-            errorCount.incrementAndGet();
-        }
-
-        // Notify the message processor about the deserialization error
-        messageProcessor.processDeserializationError(data, ex);
-    }
 }

@@ -1,4 +1,4 @@
-package com.example.demo;
+package com.example.demo.base;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
@@ -13,8 +13,8 @@ public interface MessageProcessor {
      * Process a single Kafka message.
      *
      * @param record The consumer record to process
-     * @throws ErrorHandlerConfig.RetryableException for transient errors that should be retried
-     * @throws ErrorHandlerConfig.NotRetryableException for permanent errors that should not be retried
+     * @throws RetryableException for transient errors that should be retried
+     * @throws NotRetryableException for permanent errors that should not be retried
      */
     void process(ConsumerRecord<String, DocumentOperation> record);
 
