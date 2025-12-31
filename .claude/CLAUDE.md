@@ -4,14 +4,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Spring Boot 3.5 demonstration project showing how to handle Kafka JSON deserialization errors using Spring Kafka's `ErrorHandlingDeserializer`. The core purpose is to demonstrate that when invalid JSON arrives on a Kafka topic, the consumer's message handler is still invoked (with a null value) allowing the application to handle deserialization failures gracefully.
+This is a Spring Boot 3.5 demonstration project showing how to handle Kafka JSON deserialization errors and processing errors using Spring Kafka's `ErrorHandlingDeserializer` and `DefaultErrorHandler`. The core purpose is to demonstrate:
+1. Graceful handling of deserialization errors (invalid JSON) without crashing the consumer
+2. Retry logic for transient processing errors with configurable backoff strategy
+3. Distinction between retryable and non-retryable errors
 
-**Key Architecture Pattern:**
-- Kafka messages are consumed as `DocumentOperation` records (JSON deserialized)
-- The `ErrorHandlingDeserializer` wraps the `JsonDeserializer` so deserialization failures don't crash the consumer
-- When deserialization fails, the message listener receives a `ConsumerRecord` with `null` value
-- The application extracts the exception from Kafka headers using `SerializationUtils.getExceptionFromHeader()`
-- This allows tracking both successful and failed messages
+**Key Architecture Patterns:**
+
+### Two-Tier Error Handling Strategy
+
+**1. Deserialization Errors (Non-Retryable)**
+- Handled by `ErrorHandlingDeserializer` wrapping `JsonDeserializer`
+- When deserialization fails, the batch listener receives a `ConsumerRecord` with `null` value
+- Exception extracted from Kafka headers using `SerializationUtils.getExceptionFromHeader()`
+- These errors are NOT retried (data is corrupted)
+- Logged and counted, then skipped to process next message
+
+**2. Processing Errors (Potentially Retryable)**
+- Handled by `DefaultErrorHandler` configured in `ErrorHandlerConfig.java`
+- Retry strategy: 3 attempts with 500ms fixed backoff
+- `RetryableException` → triggers retry
+- `NotRetryableException` & `IllegalArgumentException` → no retry
+- Failed messages after all retries → sent to `ConsumerRecordRecoverer` (currently logging only, should use DLQ in production)
+
+### Message Processing Model
+- Uses **batch-level listening** (`BatchAcknowledgingMessageListener`) instead of record-level
+- **Manual acknowledgment mode** (`AckMode.MANUAL`) for at-least-once semantics
+- Batch is acknowledged only after all records are processed
+- If processing fails before acknowledgment, offset is not committed → redelivery occurs
 
 ## Build & Run Commands
 
@@ -37,24 +57,61 @@ This is a Spring Boot 3.5 demonstration project showing how to handle Kafka JSON
 
 ## Architecture Details
 
-### Kafka Configuration Flow
+### Component Overview
 
-The Kafka configuration uses a specific setup in `KafkaConfig.java`:
-
+**KafkaConfig.java** - Kafka consumer configuration
 1. Creates a `JsonDeserializer<DocumentOperation>` configured with trusted packages
 2. Wraps it with `ErrorHandlingDeserializer` for both key and value deserializers
 3. This ensures deserialization exceptions are captured in Kafka message headers rather than crashing the consumer
 
+**ErrorHandlerConfig.java** - Error handling and retry configuration (see `ErrorHandlerConfig.java`)
+1. **pipelineProcessingConsumerErrorHandler** - Configures `DefaultErrorHandler` with:
+   - Retry strategy (3 attempts, 500ms backoff)
+   - Retryable exceptions: `RetryableException`
+   - Non-retryable exceptions: `NotRetryableException`, `IllegalArgumentException`
+   - Manual acknowledgment settings: `setAckAfterHandle(true)`, `setCommitRecovered(true)`
+2. **consumerRecordRecoverer** - `LoggingOnlyRecoverer` logs failed records after all retries
+   - ⚠️ Production should use `DeadLetterPublishingRecoverer` to send to DLQ
+3. **loggingRetryListener** - Logs each retry attempt with delivery attempt number
+
+**KafkaInputChannel.java** - Message listener and processing (see `KafkaInputChannel.java`)
+1. Uses `BatchAcknowledgingMessageListener` for batch-level message processing
+2. Configured with manual acknowledgment mode (`AckMode.MANUAL`)
+3. Injects `CommonErrorHandler` from `ErrorHandlerConfig`
+4. Processes each record in batch, separating deserialization errors from successful messages
+
 ### Message Processing Flow
 
-The message flow through `KafkaInputChannel.java`:
+**Normal Flow (KafkaInputChannel.java:54-71):**
+1. `ConcurrentMessageListenerContainer` receives batch of messages from "input-topic"
+2. `handleBatch()` iterates through each `ConsumerRecord` in the batch
+3. For each record:
+   - **If `data.value() != null`** → `processRecord()` → increment `processedCount`
+   - **If `data.value() == null`** → `processDeserializationError()` → extract exception from headers → log error → increment `errorCount`
+4. After all records processed → `acknowledgment.acknowledge()` commits offsets
 
-1. `ConcurrentMessageListenerContainer` receives messages from the "input-topic"
-2. `handleRecord()` method checks if `data.value()` is null
-3. If null, extracts the deserialization exception from headers
-4. Maintains counters: `processedCount` for successful messages, `errorCount` for deserialization failures
+**Error Handling Flow:**
+- **Deserialization errors**: Handled inline in `handleBatch()`, no retry, continue to next record
+- **Processing errors**: If `processRecord()` throws:
+  - `RetryableException` → `DefaultErrorHandler` retries up to 3 times with 500ms backoff
+  - `NotRetryableException` or `IllegalArgumentException` → no retry, sent to recoverer immediately
+  - Other exceptions → follows retry policy based on handler configuration
 
-**Important:** The commented line `containerProperties.setCheckDeserExWhenValueNull(false)` in `KafkaInputChannel.java:33` represents a configuration that was explored during development. The current behavior works without this setting.
+### Key Implementation Details
+
+- **Batch listening is crucial**: With batch listeners, null values from deserialization errors ARE passed to the listener (unlike record-level listeners)
+- **Manual acknowledgment**: Ensures at-least-once semantics - if processing fails before `acknowledge()`, messages are redelivered
+- **Error handler settings**: `setAckAfterHandle(true)` and `setCommitRecovered(true)` are important for manual acknowledge mode
+
+### Custom Exception Classes
+
+**ErrorHandlerConfig.RetryableException** (see `ErrorHandlerConfig.java:186-202`)
+- Use this for transient errors that should be retried (network issues, temporary service unavailability, etc.)
+- Triggers the retry mechanism with backoff strategy
+
+**ErrorHandlerConfig.NotRetryableException** (see `ErrorHandlerConfig.java:165-182`)
+- Use this for permanent errors that won't succeed on retry (validation errors, business logic violations, etc.)
+- Skips retry and goes directly to the recoverer
 
 ### Testing Strategy
 
