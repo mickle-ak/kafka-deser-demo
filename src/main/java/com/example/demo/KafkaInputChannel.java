@@ -21,12 +21,16 @@ public class KafkaInputChannel {
 
     private final ConsumerFactory<String, DocumentOperation> consumerFactory;
     private final CommonErrorHandler errorHandler;
+    private final MessageProcessor messageProcessor;
     public final AtomicInteger processedCount = new AtomicInteger(0);
     public final AtomicInteger errorCount = new AtomicInteger(0);
 
-    public KafkaInputChannel(ConsumerFactory<String, DocumentOperation> consumerFactory, CommonErrorHandler  errorHandler) {
+    public KafkaInputChannel(ConsumerFactory<String, DocumentOperation> consumerFactory,
+                             CommonErrorHandler errorHandler,
+                             MessageProcessor messageProcessor) {
         this.consumerFactory = consumerFactory;
         this.errorHandler = errorHandler;
+        this.messageProcessor = messageProcessor;
         createListenerContainer();
     }
 
@@ -57,7 +61,8 @@ public class KafkaInputChannel {
 
             // STEP 1: Check for DESERIALIZATION errors (pre-listener, not retryable)
             if (data.value() != null) {
-                processRecord(data);
+                // STEP 2: Try to process the record with retry logic for retryable exceptions
+                processRecordWithRetry(data);
             } else {
                 // Deserialization errors are NOT retryable - data is corrupted
                 // Continue to next record - don't throw exception
@@ -70,9 +75,78 @@ public class KafkaInputChannel {
         acknowledgment.acknowledge();
     }
 
+    /**
+     * Process a single record with manual retry logic.
+     * - RetryableException: retry up to 3 times with 500ms backoff
+     * - NotRetryableException: skip and continue
+     * - Other exceptions: treat as retryable
+     */
+    private void processRecordWithRetry(ConsumerRecord<String, DocumentOperation> data) {
+        int maxAttempts = 3;
+        long backoffMs = 500;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                processRecord(data);
+                return; // Success - exit retry loop
+            } catch (ErrorHandlerConfig.NotRetryableException e) {
+                // Not retryable - log and stop trying this record
+                log.error(">>> Non-retryable error processing record [{}], skipping: {}",
+                          data.key(), ErrorHandlerConfig.exceptionAsString(e));
+                return; // Exit without incrementing processedCount
+            } catch (ErrorHandlerConfig.RetryableException e) {
+                // Retryable exception - log and retry if attempts remain
+                if (attempt < maxAttempts) {
+                    log.warn("Retrying ({} attempt) for key '{}': \n\t{}",
+                             attempt, data.key(), ErrorHandlerConfig.exceptionAsString(e));
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        log.error("Retry interrupted for key '{}'", data.key());
+                        return;
+                    }
+                } else {
+                    // Max attempts reached - send to recoverer (just log for now)
+                    log.error("""
+
+                              ***
+                              *** Message processing failed after all retries. Sending to nowhere (just logging for now).
+                              *** Record: [{}-{}@{}] Key: '{}' - skipping
+                              *** Error: {}
+                              *** Value:
+                              {}
+                              ***
+                              """,
+                              data.topic(), data.partition(), data.offset(), data.key(),
+                              ErrorHandlerConfig.exceptionAsString(e),
+                              data.value());
+                    return; // Exit without incrementing processedCount
+                }
+            } catch (Exception e) {
+                // Other exceptions - treat as retryable by wrapping
+                if (attempt < maxAttempts) {
+                    log.warn("Retrying ({} attempt) for key '{}' due to unexpected error: \n\t{}",
+                             attempt, data.key(), ErrorHandlerConfig.exceptionAsString(e));
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        log.error("Retry interrupted for key '{}'", data.key());
+                        return;
+                    }
+                } else {
+                    log.error(">>> Unexpected error processing record [{}] after {} attempts, skipping: {}",
+                              data.key(), maxAttempts, ErrorHandlerConfig.exceptionAsString(e));
+                    return;
+                }
+            }
+        }
+    }
+
 
     private void processRecord(ConsumerRecord<String, DocumentOperation> data) {
-        log.info("Successfully processed record: {}", data.value());
+        messageProcessor.process(data);
         processedCount.incrementAndGet();
     }
 
@@ -87,5 +161,8 @@ public class KafkaInputChannel {
                       data.topic(), data.partition(), data.offset(), ex.getMessage());
             errorCount.incrementAndGet();
         }
+
+        // Notify the message processor about the deserialization error
+        messageProcessor.processDeserializationError(data, ex);
     }
 }
