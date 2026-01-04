@@ -1,10 +1,10 @@
 package com.example.demo.base;
 
+import com.example.demo.recordListenerCustomErrorHandler.KafkaDeserializationErrorHandler;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.springframework.core.log.LogAccessor;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.support.serializer.SerializationUtils;
 
@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public abstract class AbstractMessageListener implements MessageListener {
 
     protected final MessageProcessor messageProcessor;
+
     protected ConcurrentMessageListenerContainer<String, DocumentOperation> container;
 
     @Getter
@@ -34,10 +35,11 @@ public abstract class AbstractMessageListener implements MessageListener {
     }
 
     protected void processDeserializationError(ConsumerRecord<String, DocumentOperation> data) {
-        Exception ex = SerializationUtils.getExceptionFromHeader(
-                data,
-                SerializationUtils.VALUE_DESERIALIZER_EXCEPTION_HEADER,
-                new LogAccessor("com.example.demo"));
+        processDeserializationError(data, SerializationUtils.VALUE_DESERIALIZER_EXCEPTION_HEADER);
+    }
+
+    protected void processDeserializationError(ConsumerRecord<String, DocumentOperation> data, String headerName) {
+        Exception ex = KafkaDeserializationErrorHandler.getDeserializationException(data, headerName);
         messageProcessor.processDeserializationError(data, ex);
         errorCount.incrementAndGet();
     }
